@@ -73,13 +73,15 @@ class AndroidCacheFixPlugin implements Plugin<Project> {
     /**
      * Fix {@link org.gradle.api.tasks.compile.CompileOptions#getBootClasspath()} introducing relocatability problems for {@link AndroidJavaCompile}.
      */
-    @AndroidIssue(introducedIn = "3.0.0", fixedIn = ["3.1.0-alpha02", "3.1.0-alpha03", "3.1.0-alpha04"], link = "https://issuetracker.google.com/issues/68392933")
+    @AndroidIssue(introducedIn = "3.0.0", link = "https://issuetracker.google.com/issues/68392933")
     static class AndroidJavaCompile_BootClasspath_Workaround implements Workaround {
         @Override
         @CompileStatic(TypeCheckingMode.SKIP)
         void apply(Project project) {
             project.tasks.withType(AndroidJavaCompile) { AndroidJavaCompile task ->
                 task.inputs.property "options.bootClasspath", ""
+                // Override workaround introduced in 3.1.0-alpha02
+                task.inputs.property "options.bootClasspath.filtered", ""
                 task.inputs.files({
                         DeprecationLogger.whileDisabled({
                             //noinspection GrDeprecatedAPIUsage
@@ -154,15 +156,12 @@ class AndroidCacheFixPlugin implements Plugin<Project> {
         void apply(Project project) {
             compilerArgsProcessor.addRule(Skip.matching("-Aandroid.databinding.sdkDir=.*"))
             compilerArgsProcessor.addRule(Skip.matching("-Aandroid.databinding.bindingBuildFolder=.*"))
+            compilerArgsProcessor.addRule(Skip.matching("-Aandroid.databinding.xmlOutDir=.*"))
 
             def outputRules = [
                 AnnotationProcessorOverride.of("android.databinding.generationalFileOutDir") { AndroidJavaCompile task, String path ->
                     task.outputs.dir(path)
                         .withPropertyName("android.databinding.generationalFileOutDir.workaround")
-                },
-                AnnotationProcessorOverride.of("android.databinding.xmlOutDir") { AndroidJavaCompile task, String path ->
-                    task.outputs.dir(path)
-                        .withPropertyName("android.databinding.xmlOutDir.workaround")
                 },
                 AnnotationProcessorOverride.of("android.databinding.exportClassListTo") { AndroidJavaCompile task, String path ->
                     task.outputs.file(path)
