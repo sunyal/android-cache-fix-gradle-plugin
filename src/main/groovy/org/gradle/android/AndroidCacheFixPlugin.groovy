@@ -12,12 +12,16 @@ import groovy.transform.TypeCheckingMode
 import org.gradle.api.Plugin
 import org.gradle.api.Project
 import org.gradle.api.tasks.PathSensitivity
+import org.gradle.api.tasks.util.PatternFilterable
 import org.gradle.internal.Factory
 import org.gradle.util.DeprecationLogger
 import org.gradle.util.GradleVersion
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 
+import static org.gradle.android.CompilerArgsProcessor.AnnotationProcessorOverride
+import static org.gradle.android.CompilerArgsProcessor.Skip
+import static org.gradle.android.CompilerArgsProcessor.SkipNext
 import static org.gradle.android.Versions.android
 
 @CompileStatic
@@ -25,17 +29,6 @@ class AndroidCacheFixPlugin implements Plugin<Project> {
     private static final Logger LOGGER = LoggerFactory.getLogger(AndroidCacheFixPlugin)
 
     private static final String IGNORE_VERSION_CHECK_PROPERTY = "org.gradle.android.cache-fix.ignoreVersionCheck"
-
-    private static final List<Workaround> WORKAROUNDS = [
-        new AndroidJavaCompile_BootClasspath_Workaround(),
-        new AndroidJavaCompile_AnnotationProcessorSource_Workaround(),
-        new AndroidJavaCompile_ProcessorListFile_Workaround(),
-        new AndroidJavaCompile_DataBindingDependencyArtifacts_Workaround(),
-        new ExtractAnnotations_Source_Workaround(),
-        new CombinedInput_Workaround(),
-        new ProcessAndroidResources_MergeBlameLogFolder_Workaround(),
-        new CheckManifest_Manifest_Workaround(),
-    ] as List<Workaround>
 
     @Override
     void apply(Project project) {
@@ -51,7 +44,19 @@ class AndroidCacheFixPlugin implements Plugin<Project> {
             }
         }
 
-        for (def workaround : WORKAROUNDS) {
+        def compilerArgsProcessor = new CompilerArgsProcessor(project)
+        def workarounds = [
+            new AndroidJavaCompile_BootClasspath_Workaround(),
+            new AndroidJavaCompile_AnnotationProcessorSource_Workaround(compilerArgsProcessor),
+            new AndroidJavaCompile_ProcessorListFile_Workaround(),
+            new DataBindingDependencyArtifacts_Workaround(compilerArgsProcessor),
+            new ExtractAnnotations_Source_Workaround(),
+            new CombinedInput_Workaround(),
+            new ProcessAndroidResources_MergeBlameLogFolder_Workaround(),
+            new CheckManifest_Manifest_Workaround(),
+        ]
+
+        for (def workaround : workarounds) {
             def androidIssue = workaround.class.getAnnotation(AndroidIssue)
             def introducedIn = android(androidIssue.introducedIn())
             if (currentAndroidVersion < introducedIn) {
@@ -93,27 +98,16 @@ class AndroidCacheFixPlugin implements Plugin<Project> {
      */
     @AndroidIssue(introducedIn = "3.0.0", link = "https://issuetracker.google.com/issues/68391973")
     static class AndroidJavaCompile_AnnotationProcessorSource_Workaround implements Workaround {
+        private final CompilerArgsProcessor compilerArgsProcessor
+
+        AndroidJavaCompile_AnnotationProcessorSource_Workaround(CompilerArgsProcessor compilerArgsProcessor) {
+            this.compilerArgsProcessor = compilerArgsProcessor
+        }
+
         @CompileStatic(TypeCheckingMode.SKIP)
         @Override
         void apply(Project project) {
-            project.tasks.withType(AndroidJavaCompile) { AndroidJavaCompile task ->
-                task.inputs.property "options.compilerArgs", ""
-                task.inputs.property "options.compilerArgs.workaround", {
-                    def filteredArgs = []
-                    def iCompilerArgs = task.options.compilerArgs.iterator()
-                    while (iCompilerArgs.hasNext()) {
-                        def compilerArg = iCompilerArgs.next()
-                        if (compilerArg == "-s") {
-                            if (iCompilerArgs.hasNext()) {
-                                iCompilerArgs.next()
-                            }
-                        } else {
-                            filteredArgs += compilerArg
-                        }
-                    }
-                    return filteredArgs
-                }
-            }
+            compilerArgsProcessor.addRule(SkipNext.matching("-s"))
         }
     }
 
@@ -149,28 +143,78 @@ class AndroidCacheFixPlugin implements Plugin<Project> {
      * Override path sensitivity for {@link AndroidJavaCompile#getDataBindingDependencyArtifacts()} to {@link PathSensitivity#RELATIVE}.
      */
     @AndroidIssue(introducedIn = "3.0.0", link = "https://issuetracker.google.com/issues/68759178")
-    static class AndroidJavaCompile_DataBindingDependencyArtifacts_Workaround implements Workaround {
-        @CompileStatic(TypeCheckingMode.SKIP)
+    static class DataBindingDependencyArtifacts_Workaround implements Workaround {
+        private final CompilerArgsProcessor compilerArgsProcessor
+
+        DataBindingDependencyArtifacts_Workaround(CompilerArgsProcessor compilerArgsProcessor) {
+            this.compilerArgsProcessor = compilerArgsProcessor
+        }
+
         @Override
         void apply(Project project) {
+            compilerArgsProcessor.addRule(Skip.matching("-Aandroid.databinding.sdkDir=.*"))
+            compilerArgsProcessor.addRule(Skip.matching("-Aandroid.databinding.bindingBuildFolder=.*"))
+            compilerArgsProcessor.addRule(AnnotationProcessorOverride.of("android.databinding.generationalFileOutDir") { AndroidJavaCompile task, String path ->
+                task.outputs.dir(path)
+                    .withPropertyName("android.databinding.generationalFileOutDir.workaround")
+            })
+            compilerArgsProcessor.addRule(AnnotationProcessorOverride.of("android.databinding.xmlOutDir") { AndroidJavaCompile task, String path ->
+                task.outputs.dir(path)
+                    .withPropertyName("android.databinding.xmlOutDir.workaround")
+            })
+            compilerArgsProcessor.addRule(AnnotationProcessorOverride.of("android.databinding.exportClassListTo") { AndroidJavaCompile task, String path ->
+                task.outputs.file(path)
+                    .withPropertyName("android.databinding.exportClassListTo")
+            })
             project.tasks.withType(AndroidJavaCompile) { AndroidJavaCompile task ->
-                def originalValue
+                reconfigurePathSensitivityForDataBindingDependencyArtifacts(project, task)
+                filterDataBindingInfoFromSource(project, task)
+            }
+        }
 
-                project.gradle.taskGraph.beforeTask {
-                    if (task == it) {
-                        originalValue = task.dataBindingDependencyArtifacts
-                        if (originalValue != null) {
-                            task.dataBindingDependencyArtifacts = project.files()
-                            task.inputs.files(originalValue)
-                                .withPathSensitivity(PathSensitivity.RELATIVE)
-                                .withPropertyName("dataBindingDependencyArtifacts.workaround")
-                        }
+        @CompileStatic(TypeCheckingMode.SKIP)
+        private static void reconfigurePathSensitivityForDataBindingDependencyArtifacts(Project project, AndroidJavaCompile task) {
+            def originalValue
+
+            project.gradle.taskGraph.beforeTask {
+                if (task == it) {
+                    originalValue = task.dataBindingDependencyArtifacts
+                    if (originalValue != null) {
+                        task.dataBindingDependencyArtifacts = project.files()
+                        task.inputs.files(originalValue)
+                            .withPathSensitivity(PathSensitivity.RELATIVE)
+                            .withPropertyName("dataBindingDependencyArtifacts.workaround")
                     }
                 }
+            }
 
-                task.doFirst {
-                    task.dataBindingDependencyArtifacts = originalValue
+            task.doFirst {
+                task.dataBindingDependencyArtifacts = originalValue
+            }
+        }
+
+        @CompileStatic(TypeCheckingMode.SKIP)
+        private static void filterDataBindingInfoFromSource(Project project, AndroidJavaCompile task) {
+            def originalValue
+
+            project.gradle.taskGraph.beforeTask {
+                if (task == it) {
+                    originalValue = task.source
+                    if (originalValue != null) {
+                        task.source = project.files()
+                        def filteredSources = originalValue.matching { PatternFilterable filter ->
+                            filter.exclude("android/databinding/layouts/DataBindingInfo.java")
+                        }
+                        task.inputs.files(filteredSources)
+                            .withPathSensitivity(PathSensitivity.RELATIVE)
+                            .withPropertyName("source.workaround")
+                            .skipWhenEmpty()
+                    }
                 }
+            }
+
+            task.doFirst {
+                task.source = originalValue
             }
         }
     }
